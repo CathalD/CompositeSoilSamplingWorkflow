@@ -1,0 +1,1080 @@
+// ============================================================================
+// CARBON STOCK MAPPING FRAMEWORK FOR CANADA
+// ============================================================================
+// Author: Enhanced Framework based on Cathal Doherty's work
+// Version: 6.0 - Production-ready framework with ML-ready outputs
+// Purpose: Generate high-quality remote sensing predictors for carbon stock ML models
+// Target Region: Canada (adaptable to any region)
+// ============================================================================
+
+// ============================================================================
+// SECTION 1: CONFIGURATION AND INITIALIZATION
+// ============================================================================
+
+//Update AOI to be Seagrass and SaltMarshes
+//var saltmarsh = ee.FeatureCollection('projects/north-star-project-470316/assets/BCSaltMarshSimple')
+//Map.addLayer(saltmarsh)
+//var seagrass = ee.FeatureCollection('projects/north-star-project-470316/assets/BCSeagrasses')
+//Map.addLayer(seagrass)
+//var AOI = saltmarsh.merge(seagrass)
+//var AOI = AOI.geometry()
+/**
+ * Main configuration object - Modify these parameters for your AOI
+ * @type {Object}
+ */
+ var area = ee.FeatureCollection("projects/northstarlabs/assets/hr_cores")
+ Map.addLayer(area)
+ 
+ // ====== Alterntively draw your AOI with geometry tools ========
+ var AOI = geometry
+ 
+var CONFIG = {
+  // Spatial Configuration
+  aoi: AOI, // Replace with your area of interest
+  exportScale: 30, // Export resolution in meters
+  exportCRS: 'EPSG:4326', // WGS84 for compatibility
+  processingCRS: 'EPSG:3347', // Statistics Canada Lambert projection
+  
+  // Temporal Configuration
+  yearStart: 2022,
+  yearEnd: 2024,
+  growingSeasonStartMonth: 5, // May
+  growingSeasonEndMonth: 9, // September
+  
+  // Quality Control Thresholds
+  s2CloudThreshold: 30, // Maximum cloud cover percentage
+  s1SpeckleFilterSize: 7, // Speckle filter focal median size
+  minObservationsRequired: 5, // Minimum observations per pixel
+  slopeThreshold: 30, // Degrees - flag steep terrain
+  
+  // Processing Parameters
+  qaStatsScaleMultiplier: 4, // Multiplier for QA statistics scale
+  qaFocalRadius_pixels: 3, // Focal radius for spatial statistics
+  textureWindowSize: 3, // GLCM texture window size
+  
+  // Export Configuration
+  exportFolder: 'GEE_CarbonStock_Canada',
+  exportPrefix: 'CarbonStock',
+  maxPixels: 1e10,
+  
+  // Visualization Style
+  aoiVisStyle: {color: 'red', fillColor: '00000000', width: 2},
+  
+  // Machine Learning Features
+  includeTextureFeatures: true,
+  includeSeasonalMetrics: true,
+  includePhenologyMetrics: true,
+  includeRadarIndices: true,
+  
+  // Sample Generation
+  generateSamples: true,
+  sampleSize: 100,
+  sampleScale: 30,
+  sampleSeed: 42
+};
+
+// Validate configuration
+function validateConfig() {
+  var errors = [];
+  
+  if (!CONFIG.aoi) {
+    errors.push('ERROR: Area of Interest (aoi) is not defined');
+  }
+  
+  if (CONFIG.yearEnd < CONFIG.yearStart) {
+    errors.push('ERROR: yearEnd must be >= yearStart');
+  }
+  
+  if (CONFIG.growingSeasonEndMonth <= CONFIG.growingSeasonStartMonth) {
+    errors.push('ERROR: Growing season end month must be after start month');
+  }
+  
+  if (CONFIG.exportScale < 10 || CONFIG.exportScale > 1000) {
+    errors.push('WARNING: Unusual export scale: ' + CONFIG.exportScale);
+  }
+  
+  if (errors.length > 0) {
+    print('=== CONFIGURATION ISSUES ===');
+    errors.forEach(function(error) { print(error); });
+    if (errors.some(function(e) { return e.indexOf('ERROR') === 0; })) {
+      throw new Error('Configuration validation failed. Fix errors above.');
+    }
+  } else {
+    print('✓ Configuration validated successfully');
+  }
+  
+  return errors.length === 0;
+}
+
+// Validate on load
+validateConfig();
+
+// Initialize dates
+var startDate = ee.Date.fromYMD(CONFIG.yearStart, 1, 1);
+var endDate = ee.Date.fromYMD(CONFIG.yearEnd, 12, 31);
+var growingSeasonStart = ee.Date.fromYMD(CONFIG.yearStart, CONFIG.growingSeasonStartMonth, 1);
+var growingSeasonEnd = ee.Date.fromYMD(CONFIG.yearEnd, CONFIG.growingSeasonEndMonth, 30);
+
+// Setup map
+Map.centerObject(CONFIG.aoi);
+Map.addLayer(CONFIG.aoi, CONFIG.aoiVisStyle, 'Area of Interest');
+
+// ============================================================================
+// SECTION 2: HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * Safely handle potentially empty collections
+ * @param {ee.ImageCollection} collection - Input collection
+ * @param {string} bandName - Name for the default band if empty
+ * @return {ee.ImageCollection} Original or placeholder collection
+ */
+function handleEmptyCollection(collection, bandName) {
+  return ee.ImageCollection(
+    ee.Algorithms.If(
+      collection.size().gt(0),
+      collection,
+      ee.ImageCollection([
+        ee.Image.constant(0).rename(bandName).selfMask()
+          .set('empty_collection', true)
+      ])
+    )
+  );
+}
+
+/**
+ * Calculate percentile composites for a collection
+ * @param {ee.ImageCollection} collection - Input collection
+ * @param {Array} percentiles - Array of percentiles to calculate
+ * @return {ee.Image} Multi-band image with percentile composites
+ */
+function calculatePercentiles(collection, percentiles) {
+  var percentileImages = percentiles.map(function(p) {
+    return collection.reduce(ee.Reducer.percentile([p]))
+      .rename(collection.first().bandNames().map(function(b) {
+        return ee.String(b).cat('_p').cat(ee.Number(p).int().format());
+      }));
+  });
+  return ee.ImageCollection(percentileImages).toBands();
+}
+
+/**
+ * Add normalized indices to an image
+ * @param {ee.Image} image - Input image
+ * @param {string} band1 - First band name
+ * @param {string} band2 - Second band name
+ * @param {string} indexName - Output index name
+ * @return {ee.Image} Image with added index
+ */
+function addNormalizedIndex(image, band1, band2, indexName) {
+  var index = image.select(band1).subtract(image.select(band2))
+    .divide(image.select(band1).add(image.select(band2)))
+    .rename(indexName);
+  return image.addBands(index);
+}
+
+// ============================================================================
+// SECTION 3: TOPOGRAPHIC FEATURES
+// ============================================================================
+
+print('=== Processing Topographic Features ===');
+
+// Canadian Digital Elevation Model
+var cdem = ee.ImageCollection('NRCan/CDEM')
+  .filterBounds(CONFIG.aoi)
+  .select('elevation')
+  .median()
+  .rename('elevation_m')
+  .clip(CONFIG.aoi);
+
+// Terrain derivatives
+var terrain = ee.Algorithms.Terrain(cdem);
+var slope = terrain.select('slope').rename('slope_deg');
+var aspect = terrain.select('aspect').rename('aspect_deg');
+
+// Additional topographic indices
+var aspectRad = aspect.multiply(Math.PI).divide(180);
+var northness = aspectRad.cos().rename('northness');
+var eastness = aspectRad.sin().rename('eastness');
+
+// Topographic Position Index (TPI) - difference from focal mean
+var tpi = cdem.subtract(
+  cdem.focal_mean(CONFIG.qaFocalRadius_pixels, 'circle', 'pixels')
+).rename('tpi');
+
+// Terrain Ruggedness Index (TRI) - focal standard deviation
+var tri = cdem.reduceNeighborhood({
+  reducer: ee.Reducer.stdDev(),
+  kernel: ee.Kernel.circle(CONFIG.qaFocalRadius_pixels, 'pixels')
+}).rename('tri');
+
+// Combine topographic features
+var topographicFeatures = ee.Image.cat([
+  cdem, slope, aspect, northness, eastness, tpi, tri
+]);
+
+print('Topographic features processed:', topographicFeatures.bandNames());
+
+// ============================================================================
+// SECTION 4: LANDSAT 8/9 THERMAL AND OPTICAL FEATURES
+// ============================================================================
+
+print('=== Processing Landsat Thermal Features ===');
+
+/**
+ * Cloud masking function for Landsat 8/9
+ * @param {ee.Image} image - Landsat image
+ * @return {ee.Image} Masked image
+ */
+function maskLandsatClouds(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudShadowBitMask = (1 << 4);
+  var cloudsBitMask = (1 << 3);
+  var cirrusBitMask = (1 << 2);
+  
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+    .and(qa.bitwiseAnd(cloudsBitMask).eq(0))
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  
+  return image.updateMask(mask);
+}
+
+/**
+ * Calculate Land Surface Temperature
+ * @param {ee.Image} image - Landsat image
+ * @return {ee.Image} Image with LST band
+ */
+function calculateLST(image) {
+  var lst_celsius = image.select('ST_B10')
+    .multiply(0.00341802).add(149.0).subtract(273.15)
+    .rename('LST_C');
+  return image.addBands(lst_celsius);
+}
+
+/**
+ * Add spectral indices to Landsat image
+ * @param {ee.Image} image - Landsat image
+ * @return {ee.Image} Image with indices
+ */
+function addLandsatIndices(image) {
+  // Scale bands to [0,1]
+  var scaled = image.select(['SR_B.*']).multiply(0.0000275).add(-0.2);
+  
+  // NDVI
+  var ndvi = scaled.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+  
+  // NDMI (Normalized Difference Moisture Index)
+  var ndmi = scaled.normalizedDifference(['SR_B5', 'SR_B6']).rename('NDMI');
+  
+  // NBR (Normalized Burn Ratio)
+  var nbr = scaled.normalizedDifference(['SR_B5', 'SR_B7']).rename('NBR');
+  
+  return image.addBands([ndvi, ndmi, nbr]);
+}
+
+// Process Landsat collections
+var landsat8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
+  .filterBounds(CONFIG.aoi)
+  .filterDate(startDate, endDate)
+  .map(maskLandsatClouds)
+  .map(calculateLST)
+  .map(addLandsatIndices);
+
+// Handle empty collection
+landsat8 = handleEmptyCollection(landsat8, 'LST_C');
+
+// Separate growing season
+var landsat8_growing = landsat8.filterDate(growingSeasonStart, growingSeasonEnd);
+
+// Calculate temporal metrics
+var lst_metrics = ee.Image.cat([
+  landsat8.select('LST_C').median().rename('LST_median_annual_C'),
+  landsat8.select('LST_C').reduce(ee.Reducer.stdDev()).rename('LST_stddev_annual_C'),
+  landsat8.select('LST_C').reduce(ee.Reducer.percentile([10, 90])).rename(['LST_p10_annual_C', 'LST_p90_annual_C']),
+  landsat8_growing.select('LST_C').median().rename('LST_median_growing_C'),
+  landsat8_growing.select('LST_C').reduce(ee.Reducer.stdDev()).rename('LST_stddev_growing_C'),
+  landsat8.select(['NDVI', 'NDMI', 'NBR']).median().rename(['NDVI_median_L8', 'NDMI_median_L8', 'NBR_median_L8'])
+]);
+
+print('Landsat metrics processed:', lst_metrics.bandNames());
+
+// ============================================================================
+// SECTION 5: SENTINEL-1 SAR FEATURES
+// ============================================================================
+
+print('=== Processing Sentinel-1 SAR Features ===');
+
+/**
+ * Preprocess Sentinel-1 image
+ * @param {ee.Image} image - S1 GRD image
+ * @return {ee.Image} Preprocessed image
+ */
+function preprocessS1(image) {
+  // Apply speckle filter
+  var filtered = image
+    .select(['VV', 'VH'])
+    .focal_median(CONFIG.s1SpeckleFilterSize, 'circle', 'pixels')
+    .rename(['VV_filtered', 'VH_filtered']);
+  
+  // Keep original and filtered
+  return image.select(['VV', 'VH']).addBands(filtered)
+    .copyProperties(image, image.propertyNames());
+}
+
+// Load and process Sentinel-1 (FIXED: Using CONFIG dates instead of hardcoded 2020)
+var sentinel1 = ee.ImageCollection("COPERNICUS/S1_GRD")
+  .filterBounds(CONFIG.aoi)
+  .filterDate(startDate, endDate)
+  //.clip(CONFIG.aoi); // FIXED: Added clip
+
+var s1 = sentinel1
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .map(preprocessS1);
+
+// Separate by orbit
+var s1_ascending = s1.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'));
+var s1_descending = s1.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+
+// Calculate comprehensive SAR metrics
+function calculateSARMetrics(collection, suffix) {
+  var median = collection.select(['VV_filtered', 'VH_filtered']).median();
+  var vv = median.select('VV_filtered').rename('VV_' + suffix);
+  var vh = median.select('VH_filtered').rename('VH_' + suffix);
+  
+  // Polarimetric indices
+  var vv_vh_ratio = vv.divide(vh).rename('VV_VH_ratio_' + suffix);
+  var vh_vv_ratio = vh.divide(vv).rename('VH_VV_ratio_' + suffix);
+  var vv_minus_vh = vv.subtract(vh).rename('VV_minus_VH_' + suffix);
+  var vv_plus_vh = vv.add(vh).rename('VV_plus_VH_' + suffix);
+  
+  // Radar Vegetation Index (RVI)
+  var rvi = vh.multiply(4).divide(vv.add(vh)).rename('RVI_' + suffix);
+  
+  // Dual-pol SAR Vegetation Index (DPSVI)
+  var dpsvi = vv.add(vh).divide(2).rename('DPSVI_' + suffix);
+  
+  // Texture features on VV
+  var texture_input = vv.multiply(1000).toInt();
+  var glcm = texture_input.glcmTexture({size: CONFIG.textureWindowSize});
+  var contrast = glcm.select('VV_' + suffix + '_contrast').rename('VV_contrast_' + suffix);
+  var entropy = glcm.select('VV_' + suffix + '_ent').rename('VV_entropy_' + suffix);
+  var homogeneity = glcm.select('VV_' + suffix + '_asm').rename('VV_homogeneity_' + suffix);
+  var correlation = glcm.select('VV_' + suffix + '_corr').rename('VV_correlation_' + suffix);
+  
+  // Temporal statistics
+  var vv_stddev = collection.select('VV_filtered').reduce(ee.Reducer.stdDev()).rename('VV_stddev_' + suffix);
+  var vh_stddev = collection.select('VH_filtered').reduce(ee.Reducer.stdDev()).rename('VH_stddev_' + suffix);
+  
+  return ee.Image.cat([
+    vv, vh, vv_vh_ratio, vh_vv_ratio, vv_minus_vh, vv_plus_vh,
+    rvi, dpsvi, contrast, entropy, homogeneity, correlation,
+    vv_stddev, vh_stddev
+  ]);
+}
+
+// Process all orbits
+var sar_all = calculateSARMetrics(s1, 'all');
+var sar_asc = calculateSARMetrics(s1_ascending, 'asc');
+var sar_desc = calculateSARMetrics(s1_descending, 'desc');
+
+// Combine SAR features (using 'all' for main features, add orbit-specific if needed)
+var sarFeatures = CONFIG.includeRadarIndices ? 
+  sar_all : 
+  sar_all.select(['VV_all', 'VH_all', 'VV_VH_ratio_all', 'VV_minus_VH_all']);
+
+print('SAR features processed:', sarFeatures.bandNames());
+
+// ============================================================================
+// SECTION 6: SENTINEL-2 OPTICAL FEATURES
+// ============================================================================
+
+print('=== Processing Sentinel-2 Optical Features ===');
+
+/**
+ * Cloud masking for Sentinel-2
+ * @param {ee.Image} image - Sentinel-2 SR image
+ * @return {ee.Image} Masked image
+ */
+function maskS2Clouds(image) {
+  var scl = image.select('SCL');
+  var mask = scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10)).and(scl.neq(11));
+  return image.updateMask(mask);
+}
+
+/**
+ * Add vegetation indices to Sentinel-2 image
+ * @param {ee.Image} image - Sentinel-2 image
+ * @return {ee.Image} Image with indices
+ */
+function addS2Indices(image) {
+  // Scale bands
+  var scaled = image.select('B.*').multiply(0.0001);
+  
+  // Enhanced Vegetation Index (EVI)
+  var evi = scaled.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',
+    {
+      'NIR': scaled.select('B8'),
+      'RED': scaled.select('B4'),
+      'BLUE': scaled.select('B2')
+    }
+  ).rename('EVI');
+  
+  // NDVI
+  var ndvi = scaled.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  
+  // NDMI - moisture index
+  var ndmi = scaled.normalizedDifference(['B8', 'B11']).rename('NDMI');
+  
+  // Green Chlorophyll Index
+  var gci = scaled.select('B8').divide(scaled.select('B3')).subtract(1).rename('GCI');
+  
+  // Normalized Difference Red Edge (NDRE)
+  var ndre = scaled.normalizedDifference(['B8', 'B5']).rename('NDRE');
+  
+  // SAVI (Soil Adjusted Vegetation Index)
+  var savi = scaled.expression(
+    '((NIR - RED) / (NIR + RED + 0.5)) * 1.5',
+    {
+      'NIR': scaled.select('B8'),
+      'RED': scaled.select('B4')
+    }
+  ).rename('SAVI');
+  
+  return image.addBands([evi, ndvi, ndmi, gci, ndre, savi]);
+}
+
+// Process Sentinel-2
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(CONFIG.aoi)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', CONFIG.s2CloudThreshold))
+  .map(maskS2Clouds)
+  .map(addS2Indices);
+
+// Handle empty collection
+s2 = handleEmptyCollection(s2, 'EVI');
+
+// Growing season collection
+var s2_growing = s2.filterDate(growingSeasonStart, growingSeasonEnd);
+
+// Calculate comprehensive metrics
+var opticalMetrics = ee.Image.cat([
+  // Annual statistics
+  s2.select(['EVI', 'NDVI', 'NDMI', 'GCI', 'NDRE', 'SAVI']).median()
+    .rename(['EVI_median_annual', 'NDVI_median_annual', 'NDMI_median_annual', 
+             'GCI_median_annual', 'NDRE_median_annual', 'SAVI_median_annual']),
+  
+  s2.select(['EVI', 'NDVI']).reduce(ee.Reducer.stdDev())
+    .rename(['EVI_stddev_annual', 'NDVI_stddev_annual']),
+  
+  // Growing season statistics
+  s2_growing.select(['EVI', 'NDVI', 'NDMI']).median()
+    .rename(['EVI_median_growing', 'NDVI_median_growing', 'NDMI_median_growing']),
+  
+  s2_growing.select(['EVI', 'NDVI']).reduce(ee.Reducer.stdDev())
+    .rename(['EVI_stddev_growing', 'NDVI_stddev_growing'])
+]);
+
+// Add phenology metrics if enabled
+if (CONFIG.includePhenologyMetrics) {
+  // Calculate max-min difference (amplitude)
+  var eviAmplitude = s2.select('EVI').max().subtract(s2.select('EVI').min()).rename('EVI_amplitude');
+  var ndviAmplitude = s2.select('NDVI').max().subtract(s2.select('NDVI').min()).rename('NDVI_amplitude');
+  
+  // Add percentiles for phenology
+  var phenologyMetrics = ee.Image.cat([
+    eviAmplitude, ndviAmplitude,
+    s2.select('EVI').reduce(ee.Reducer.percentile([25, 75]))
+      .rename(['EVI_p25', 'EVI_p75']),
+    s2.select('NDVI').reduce(ee.Reducer.percentile([25, 75]))
+      .rename(['NDVI_p25', 'NDVI_p75'])
+  ]);
+  
+  opticalMetrics = opticalMetrics.addBands(phenologyMetrics);
+}
+
+print('Optical metrics processed:', opticalMetrics.bandNames());
+
+// ============================================================================
+// SECTION 7: CLIMATE AND ENVIRONMENTAL FEATURES
+// ============================================================================
+
+print('=== Processing Climate Features ===');
+
+// ERA5 Climate data (optional - uncomment if needed)
+/*
+var era5 = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_BY_HOUR')
+  .filterBounds(CONFIG.aoi)
+  .filterDate(startDate, endDate)
+  .select(['temperature_2m', 'total_precipitation_sum', 'surface_pressure']);
+
+var climateMetrics = ee.Image.cat([
+  era5.select('temperature_2m').mean().subtract(273.15).rename('mean_temp_C'),
+  era5.select('total_precipitation_sum').sum().multiply(1000).rename('total_precip_mm'),
+  era5.select('surface_pressure').mean().divide(100).rename('mean_pressure_hPa')
+]);
+*/
+
+// ============================================================================
+// SECTION 8: COMBINE ALL FEATURES
+// ============================================================================
+
+print('=== Combining All Features ===');
+
+// Combine all feature layers
+var allFeatures = ee.Image.cat([
+  topographicFeatures,
+  lst_metrics,
+  sarFeatures,
+  opticalMetrics
+  // climateMetrics // Add if using climate data
+])
+.reproject(CONFIG.exportCRS, null, CONFIG.exportScale); // FIXED: Added semicolon
+
+var allFeaturesClipped = allFeatures.clip(CONFIG.aoi);
+
+// Add metadata
+allFeatures = allFeatures.set({
+  'system:time_start': startDate.millis(),
+  'system:time_end': endDate.millis(),
+  'year_start': CONFIG.yearStart,
+  'year_end': CONFIG.yearEnd,
+  'processing_date': ee.Date(Date.now()),
+  'n_bands': allFeatures.bandNames().length(),
+  'export_scale': CONFIG.exportScale,
+  'aoi_area_km2': CONFIG.aoi.area(1).divide(1e6)
+});
+
+print('=== Final Composite ===');
+print('Total bands:', allFeatures.bandNames().length());
+print('Band names:', allFeatures.bandNames());
+
+// ============================================================================
+// SECTION 9: QUALITY ASSESSMENT
+// ============================================================================
+
+print('=== Quality Assessment ===');
+
+var qaScale = CONFIG.exportScale * CONFIG.qaStatsScaleMultiplier;
+
+// Data observation counts
+var l8_count = landsat8.select('LST_C').count().rename('L8_obs_count');
+var s2_count = s2.select('EVI').count().rename('S2_obs_count');
+var s1_count = s1.select('VV').count().rename('S1_obs_count');
+
+var observationCounts = ee.Image.cat([l8_count, s2_count, s1_count]);
+
+// Calculate coverage statistics
+var coverageStats = observationCounts.reduceRegion({
+  reducer: ee.Reducer.percentile([0, 25, 50, 75, 100]).combine(ee.Reducer.mean(), '', true),
+  geometry: CONFIG.aoi,
+  scale: qaScale,
+  maxPixels: 1e9,
+  bestEffort: true
+});
+
+print('Observation Coverage Statistics:', coverageStats);
+
+// Data completeness mask
+var completeMask = allFeatures.mask().reduce(ee.Reducer.min()).rename('data_completeness');
+var completenessPercent = completeMask.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: CONFIG.aoi,
+  scale: qaScale,
+  maxPixels: 1e9
+});
+
+print('Data Completeness (%):', ee.Number(completenessPercent.get('data_completeness')).multiply(100));
+
+// Quality flags
+var qualityFlags = ee.Image.cat([
+  slope.gt(CONFIG.slopeThreshold).rename('steep_terrain_flag'),
+  l8_count.lt(CONFIG.minObservationsRequired).rename('insufficient_thermal_flag'),
+  s2_count.lt(CONFIG.minObservationsRequired).rename('insufficient_optical_flag'),
+  s1_count.lt(CONFIG.minObservationsRequired).rename('insufficient_sar_flag')
+]);
+
+// Spatial heterogeneity assessment
+var evi_focal_cv = opticalMetrics.select('EVI_median_annual')
+  .reduceNeighborhood({
+    reducer: ee.Reducer.stdDev(),
+    kernel: ee.Kernel.square(CONFIG.qaFocalRadius_pixels, 'pixels')
+  })
+  .divide(opticalMetrics.select('EVI_median_annual').where(
+    opticalMetrics.select('EVI_median_annual').eq(0), 1e-6
+  ))
+  .multiply(100).rename('EVI_spatial_CV_pct');
+
+// ============================================================================
+// SECTION 10: VISUALIZATION
+// ============================================================================
+
+print('=== Adding Visualization Layers ===');
+
+// Define comprehensive visualization parameters
+var VIS_PARAMS = {
+  elevation: {min: 0, max: 2500, palette: ['006600', 'FFFF00', 'FF9900', 'FF0000', 'FFFFFF']},
+  slope: {min: 0, max: 45, palette: ['00FF00', 'FFFF00', 'FF0000']},
+  lst: {min: -10, max: 30, palette: ['0000FF', '00FFFF', 'FFFF00', 'FF0000']},
+  evi: {min: 0, max: 0.8, palette: ['8B4513', 'FFFF00', '228B22', '006400']},
+  ndvi: {min: 0, max: 1, palette: ['8B4513', 'FFFF00', '90EE90', '006400']},
+  vv: {min: -25, max: 0, palette: ['000000', '0000FF', '00FFFF', 'FFFFFF']},
+  vh: {min: -30, max: -5, palette: ['000000', '800080', 'FF00FF', 'FFFFFF']},
+  observationCount: {min: 0, max: 50, palette: ['FF0000', 'FFFF00', '00FF00']},
+  quality: {min: 0, max: 1, palette: ['FF0000', '00FF00']}
+};
+
+// Add key layers to map
+Map.addLayer(topographicFeatures.select('elevation_m').clip(CONFIG.aoi), VIS_PARAMS.elevation, 'Elevation', false);
+Map.addLayer(topographicFeatures.select('slope_deg'), VIS_PARAMS.slope, 'Slope', false);
+Map.addLayer(lst_metrics.select('LST_median_annual_C').clip(CONFIG.aoi), VIS_PARAMS.lst, 'LST Annual', false); // FIXED: Added semicolon
+Map.addLayer(opticalMetrics.select('EVI_median_annual').clip(CONFIG.aoi), VIS_PARAMS.evi, 'EVI Annual', false);
+Map.addLayer(opticalMetrics.select('NDVI_median_annual').clip(CONFIG.aoi), VIS_PARAMS.ndvi, 'NDVI Annual', false);
+Map.addLayer(sarFeatures.select('VV_all').clip(CONFIG.aoi), VIS_PARAMS.vv, 'SAR VV', false);
+Map.addLayer(sarFeatures.select('VH_all').clip(CONFIG.aoi), VIS_PARAMS.vh, 'SAR VH', false);
+Map.addLayer(s2_count.clip(CONFIG.aoi), VIS_PARAMS.observationCount, 'S2 Observation Count', false);
+Map.addLayer(completeMask.clip(CONFIG.aoi), VIS_PARAMS.quality, 'Data Completeness', false);
+Map.addLayer(evi_focal_cv.clip(CONFIG.aoi), {min: 0, max: 100, palette: ['00FF00', 'FFFF00', 'FF0000']}, 'EVI Spatial CV%', false);
+
+// ============================================================================
+// SECTION 11: EXPORT FUNCTIONS
+// ============================================================================
+
+/**
+ * Export main composite with all features
+ */
+function exportMainComposite() {
+  var dateStr = ee.Date(Date.now()).format('YYYYMMdd').getInfo();
+  var filename = CONFIG.exportPrefix + '_Composite_' + 
+                 CONFIG.yearStart + '_' + CONFIG.yearEnd + '_' + dateStr;
+  
+  Export.image.toDrive({
+    image: allFeaturesClipped.toFloat(),
+    description: filename,
+    folder: CONFIG.exportFolder,
+    region: CONFIG.aoi,
+    scale: CONFIG.exportScale,
+    crs: CONFIG.exportCRS,
+    maxPixels: CONFIG.maxPixels,
+    fileFormat: 'GeoTIFF',
+    formatOptions: {
+      cloudOptimized: true
+    }
+  });
+  
+  print('✓ Main composite export task created: ' + filename);
+}
+
+/**
+ * Export quality assessment layers
+ */
+function exportQualityLayers() {
+  var dateStr = ee.Date(Date.now()).format('YYYYMMdd').getInfo();
+  var filename = CONFIG.exportPrefix + '_QualityLayers_' + 
+                 CONFIG.yearStart + '_' + CONFIG.yearEnd + '_' + dateStr;
+  
+  var qaComposite = ee.Image.cat([
+    observationCounts,
+    qualityFlags,
+    completeMask,
+    evi_focal_cv
+  ]).clip(CONFIG.aoi);
+  
+  Export.image.toDrive({
+    image: qaComposite.toFloat(),
+    description: filename,
+    folder: CONFIG.exportFolder,
+    region: CONFIG.aoi,
+    scale: CONFIG.exportScale,
+    crs: CONFIG.exportCRS,
+    maxPixels: CONFIG.maxPixels,
+    fileFormat: 'GeoTIFF',
+    formatOptions: {
+      cloudOptimized: true
+    }
+  });
+  
+  print('✓ Quality layers export task created: ' + filename);
+}
+
+/**
+ * Export individual feature groups
+ */
+function exportFeatureGroups() {
+  var dateStr = ee.Date(Date.now()).format('YYYYMMdd').getInfo();
+  
+  var featureGroups = [
+    {name: 'Topographic', image: topographicFeatures},
+    {name: 'Thermal', image: lst_metrics},
+    {name: 'SAR', image: sarFeatures},
+    {name: 'Optical', image: opticalMetrics}
+  ];
+  
+  featureGroups.forEach(function(group) {
+    var filename = CONFIG.exportPrefix + '_' + group.name + '_' + 
+                   CONFIG.yearStart + '_' + CONFIG.yearEnd + '_' + dateStr;
+    
+    Export.image.toDrive({
+      image: group.image.clip(CONFIG.aoi).toFloat(),
+      description: filename,
+      folder: CONFIG.exportFolder,
+      region: CONFIG.aoi,
+      scale: CONFIG.exportScale,
+      crs: CONFIG.exportCRS,
+      maxPixels: CONFIG.maxPixels,
+      fileFormat: 'GeoTIFF',
+      formatOptions: {
+        cloudOptimized: true
+      }
+    });
+    
+    print('✓ ' + group.name + ' features export task created: ' + filename);
+  });
+}
+
+/**
+ * Generate stratified random samples for ML training
+ */
+function exportTrainingSamples() {
+  if (!CONFIG.generateSamples) {
+    print('Sample generation disabled in CONFIG');
+    return;
+  }
+  
+  var dateStr = ee.Date(Date.now()).format('YYYYMMdd').getInfo();
+  var filename = CONFIG.exportPrefix + '_Samples_' + 
+                 CONFIG.yearStart + '_' + CONFIG.yearEnd + '_' + dateStr;
+  
+  // Create stratification based on EVI and elevation
+  var eviStrata = opticalMetrics.select('EVI_median_annual').multiply(10).toInt();
+  var elevStrata = cdem.divide(100).toInt();
+  var stratificationImage = eviStrata.multiply(1000).add(elevStrata).rename('strata');
+  
+  // Generate stratified random points
+  var samples = allFeaturesClipped
+    .addBands(stratificationImage)
+    .stratifiedSample({
+      numPoints: CONFIG.sampleSize,
+      classBand: 'strata',
+      region: CONFIG.aoi,
+      scale: CONFIG.sampleScale,
+      seed: CONFIG.sampleSeed,
+      geometries: true
+    });
+  
+  // Export samples as CSV/SHP
+  Export.table.toDrive({
+    collection: samples,
+    description: filename,
+    folder: CONFIG.exportFolder,
+    fileFormat: 'CSV'
+  });
+  
+  // Also export as shapefile
+  Export.table.toDrive({
+    collection: samples,
+    description: filename + '_SHP',
+    folder: CONFIG.exportFolder,
+    fileFormat: 'SHP'
+  });
+  
+  print('✓ Training samples export tasks created: ' + filename);
+  print('  Sample count: ' + CONFIG.sampleSize);
+  print('  Stratification: EVI x Elevation');
+}
+
+/**
+ * Export metadata summary
+ */
+function exportMetadata() {
+  var dateStr = ee.Date(Date.now()).format('YYYYMMdd').getInfo();
+  
+  // Create metadata feature collection
+  var metadata = ee.FeatureCollection([
+    ee.Feature(null, {
+      'export_date': dateStr,
+      'year_start': CONFIG.yearStart,
+      'year_end': CONFIG.yearEnd,
+      'export_scale': CONFIG.exportScale,
+      'export_crs': CONFIG.exportCRS,
+      'n_bands': allFeatures.bandNames().length().getInfo(),
+      'aoi_area_km2': CONFIG.aoi.area().divide(1e6).getInfo(),
+      's2_cloud_threshold': CONFIG.s2CloudThreshold,
+      'min_obs_required': CONFIG.minObservationsRequired,
+      'slope_threshold': CONFIG.slopeThreshold,
+      'texture_features': CONFIG.includeTextureFeatures,
+      'seasonal_metrics': CONFIG.includeSeasonalMetrics,
+      'phenology_metrics': CONFIG.includePhenologyMetrics,
+      'radar_indices': CONFIG.includeRadarIndices
+    })
+  ]);
+  
+  Export.table.toDrive({
+    collection: metadata,
+    description: CONFIG.exportPrefix + '_Metadata_' + dateStr,
+    folder: CONFIG.exportFolder,
+    fileFormat: 'CSV'
+  });
+  
+  print('✓ Metadata export task created');
+}
+//================== EDIT HERE =============================
+/**
+ * Export main composite to Earth Engine Asset
+ * @param {string} assetFolder - Your asset folder path (e.g., 'projects/your-project/assets/carbon-stock')
+ */
+function exportToAsset(assetFolder) {
+  var dateStr = ee.Date(Date.now()).format('YYYYMMdd').getInfo();
+  var assetName = CONFIG.exportPrefix + '_Composite_' + 
+                  CONFIG.yearStart + '_' + CONFIG.yearEnd + '_' + dateStr;
+  
+  // Construct full asset path
+  var assetPath = assetFolder + '/' + assetName;
+  
+  Export.image.toAsset({
+    image: allFeaturesClipped.toFloat(),
+    description: assetName + '_Asset',
+    assetId: assetPath,
+    region: CONFIG.aoi,
+    scale: CONFIG.exportScale,
+    crs: CONFIG.exportCRS,
+    maxPixels: CONFIG.maxPixels,
+    pyramidingPolicy: {
+      '.default': 'mean'
+    }
+  });
+  
+  print('✓ Asset export task created: ' + assetPath);
+  print('  After export completes, load with:');
+  print('  var composite = ee.Image("' + assetPath + '");');
+}
+
+/**
+ * Export feature groups to Earth Engine Assets
+ * @param {string} assetFolder - Your asset folder path
+ */
+function exportFeatureGroupsToAsset(assetFolder) {
+  var dateStr = ee.Date(Date.now()).format('YYYYMMdd').getInfo();
+  
+  var featureGroups = [
+    {name: 'Topographic', image: topographicFeatures},
+    {name: 'Thermal', image: lst_metrics},
+    {name: 'SAR', image: sarFeatures},
+    {name: 'Optical', image: opticalMetrics}
+  ];
+  
+  featureGroups.forEach(function(group) {
+    var assetName = CONFIG.exportPrefix + '_' + group.name + '_' + 
+                    CONFIG.yearStart + '_' + CONFIG.yearEnd + '_' + dateStr;
+    var assetPath = assetFolder + '/' + assetName;
+    
+    Export.image.toAsset({
+      image: group.image.clip(CONFIG.aoi).toFloat(),
+      description: assetName + '_Asset',
+      assetId: assetPath,
+      region: CONFIG.aoi,
+      scale: CONFIG.exportScale,
+      crs: CONFIG.exportCRS,
+      maxPixels: CONFIG.maxPixels,
+      pyramidingPolicy: {
+        '.default': 'mean'
+      }
+    });
+    
+    print('✓ ' + group.name + ' asset export task created: ' + assetPath);
+  });
+}
+
+/**
+ * Export quality layers to Earth Engine Asset
+ * @param {string} assetFolder - Your asset folder path
+ */
+function exportQualityLayersToAsset(assetFolder) {
+  var dateStr = ee.Date(Date.now()).format('YYYYMMdd').getInfo();
+  var assetName = CONFIG.exportPrefix + '_QualityLayers_' + 
+                  CONFIG.yearStart + '_' + CONFIG.yearEnd + '_' + dateStr;
+  var assetPath = assetFolder + '/' + assetName;
+  
+  var qaComposite = ee.Image.cat([
+    observationCounts,
+    qualityFlags,
+    completeMask,
+    evi_focal_cv
+  ]).clip(CONFIG.aoi);
+  
+  Export.image.toAsset({
+    image: qaComposite.toFloat(),
+    description: assetName + '_Asset',
+    assetId: assetPath,
+    region: CONFIG.aoi,
+    scale: CONFIG.exportScale,
+    crs: CONFIG.exportCRS,
+    maxPixels: CONFIG.maxPixels,
+    pyramidingPolicy: {
+      '.default': 'mean'
+    }
+  });
+  
+  print('✓ Quality layers asset export task created: ' + assetPath);
+}
+
+/**
+ * Export training samples to Earth Engine Asset
+ * @param {string} assetFolder - Your asset folder path
+ */
+function exportTrainingSamplesToAsset(assetFolder) {
+  if (!CONFIG.generateSamples) {
+    print('Sample generation disabled in CONFIG');
+    return;
+  }
+  
+  var dateStr = ee.Date(Date.now()).format('YYYYMMdd').getInfo();
+  var assetName = CONFIG.exportPrefix + '_Samples_' + 
+                  CONFIG.yearStart + '_' + CONFIG.yearEnd + '_' + dateStr;
+  var assetPath = assetFolder + '/' + assetName;
+  
+  // Create stratification based on EVI and elevation
+  var eviStrata = opticalMetrics.select('EVI_median_annual').multiply(10).toInt();
+  var elevStrata = cdem.divide(100).toInt();
+  var stratificationImage = eviStrata.multiply(1000).add(elevStrata).rename('strata');
+  
+  // Generate stratified random points
+  var samples = allFeaturesClipped
+    .addBands(stratificationImage)
+    .stratifiedSample({
+      numPoints: CONFIG.sampleSize,
+      classBand: 'strata',
+      region: CONFIG.aoi,
+      scale: CONFIG.sampleScale,
+      seed: CONFIG.sampleSeed,
+      geometries: true
+    });
+  
+  // Export as FeatureCollection asset
+  Export.table.toAsset({
+    collection: samples,
+    description: assetName + '_Asset',
+    assetId: assetPath
+  });
+  
+  print('✓ Training samples asset export task created: ' + assetPath);
+  print('  Sample count: ' + CONFIG.sampleSize);
+  print('  After export, load with:');
+  print('  var samples = ee.FeatureCollection("' + assetPath + '");');
+}
+
+// ============================================================================
+// SECTION 12: EXECUTE EXPORTS
+// ============================================================================
+
+print('\n=== EXPORT TASKS ===');
+print('Ready to create export tasks. Uncomment the desired exports below:\n');
+
+// Uncomment the exports you want to run:
+
+// Main composite (all features in one image)
+exportMainComposite();
+
+// Quality assessment layers
+// exportQualityLayers();
+
+// Individual feature groups (separate exports)
+// exportFeatureGroups();
+
+// Training samples for ML
+// exportTrainingSamples();
+
+// Metadata summary
+// exportMetadata();
+
+print('\n✓ Script execution complete!');
+print('Check the Tasks tab to run the export jobs.');
+
+// ============================================================================
+// SECTION 13: SUMMARY STATISTICS
+// ============================================================================
+
+print('\n=== PROCESSING SUMMARY ===');
+print('AOI Area (km²):', CONFIG.aoi.area(1).divide(1e6));
+print('Date Range:', CONFIG.yearStart, '-', CONFIG.yearEnd);
+print('Export Scale (m):', CONFIG.exportScale);
+print('Total Feature Bands:', allFeatures.bandNames().length());
+print('\nFeature Groups:');
+print('  - Topographic:', topographicFeatures.bandNames().length(), 'bands');
+print('  - Thermal (Landsat):', lst_metrics.bandNames().length(), 'bands');
+print('  - SAR (Sentinel-1):', sarFeatures.bandNames().length(), 'bands');
+print('  - Optical (Sentinel-2):', opticalMetrics.bandNames().length(), 'bands');
+
+// ============================================================================
+// ADDITIONAL UTILITIES
+// ============================================================================
+
+/**
+ * Function to inspect band statistics
+ * Call this to get detailed statistics for any band
+ */
+function inspectBandStats(bandName) {
+  var stats = allFeaturesClipped.select(bandName).reduceRegion({
+    reducer: ee.Reducer.minMax()
+      .combine(ee.Reducer.mean(), '', true)
+      .combine(ee.Reducer.stdDev(), '', true)
+      .combine(ee.Reducer.percentile([5, 25, 50, 75, 95]), '', true),
+    geometry: CONFIG.aoi,
+    scale: CONFIG.exportScale * 4,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+  
+  print('\n=== Statistics for', bandName, '===');
+  print(stats);
+  return stats;
+}
+
+// Example usage (uncomment to use):
+// inspectBandStats('EVI_median_annual');
+// inspectBandStats('LST_median_annual_C');
+// inspectBandStats('VV_all');
+
+/**
+ * Create a quick RGB visualization composite
+ */
+function createRGBComposite() {
+  // Use Sentinel-2 true color
+  var s2_median = s2.select(['B4', 'B3', 'B2']).median()
+    .multiply(0.0001)
+    .clip(CONFIG.aoi);
+  
+  Map.addLayer(s2_median, {min: 0, max: 0.3, gamma: 1.4}, 'True Color (S2)', false);
+  
+  // False color (NIR, Red, Green)
+  var s2_false = s2.select(['B8', 'B4', 'B3']).median()
+    .multiply(0.0001)
+    .clip(CONFIG.aoi);
+  
+  Map.addLayer(s2_false, {min: 0, max: 0.5, gamma: 1.4}, 'False Color (S2)', false);
+  
+  print('✓ RGB composites added to map');
+}
+
+// Add RGB composites
+createRGBComposite();
+
+print('\n=== READY FOR CARBON STOCK MODELING ===');
+print('This framework provides ML-ready predictors including:');
+print('  ✓ Topographic features (elevation, slope, aspect, TPI, TRI)');
+print('  ✓ Land Surface Temperature metrics (annual & growing season)');
+print('  ✓ SAR backscatter and derived indices (VV, VH, RVI, textures)');
+print('  ✓ Optical vegetation indices (EVI, NDVI, NDMI, GCI, NDRE, SAVI)');
+print('  ✓ Phenological metrics (amplitude, percentiles)');
+print('  ✓ Quality flags and observation counts');
+print('\nNext steps:');
+print('  1. Run export tasks from the Tasks tab');
+print('  2. Download GeoTIFFs from Google Drive');
+print('  3. Extract values at field plot locations');
+print('  4. Train ML models (Random Forest, XGBoost, etc.)');
+print('  5. Apply trained models to predict carbon stocks');
+print('\nFor questions or issues, review the configuration and band names above.');
