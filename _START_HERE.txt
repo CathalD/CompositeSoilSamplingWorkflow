@@ -1,0 +1,157 @@
+╔════════════════════════════════════════════════════════════╗
+║                                                            ║
+║   COMPOSITE SAMPLING ANALYSIS FRAMEWORK                   ║
+║   Complete R Package for Soil Core Analysis               ║
+║                                                            ║
+╚════════════════════════════════════════════════════════════╝
+
+👋 WELCOME! 
+
+You have successfully downloaded the complete analysis framework.
+
+═══════════════════════════════════════════════════════════════
+
+📦 WHAT'S INCLUDED:
+
+✅ 7 R scripts (fully functional analysis modules)
+✅ 4 comprehensive documentation files  
+✅ 2 mock data files for testing
+✅ Complete workflow for SOC and bulk density analysis
+
+═══════════════════════════════════════════════════════════════
+
+🚀 QUICK START (3 STEPS):
+
+1. READ THIS FIRST:
+   → Open README.md
+
+2. PREPARE YOUR ENVIRONMENT:
+   → Open R or RStudio
+   → Run: source("00_setup.R")
+
+3. TEST WITH MOCK DATA:
+   → Run: source("run_analysis.R")
+   → Check outputs in outputs/ folder
+
+═══════════════════════════════════════════════════════════════
+
+📚 DOCUMENTATION GUIDE:
+
+📄 README.md
+   → Start here! Overview and quick start
+   → Best for: First-time users
+
+📄 COMPLETE_GUIDE.md  
+   → Detailed documentation (14 KB)
+   → Covers: Installation, methods, interpretation
+   → Best for: Understanding the analysis
+
+📄 QUICK_REFERENCE.md
+   → Command cheat sheet
+   → Best for: Quick lookups during analysis
+
+📄 FILE_INDEX.md
+   → Complete file reference
+   → Best for: Finding specific information
+
+📄 MOCK_DATA_README.md
+   → Explains the test data files
+   → Best for: Understanding mock data structure
+
+═══════════════════════════════════════════════════════════════
+
+🔧 R SCRIPTS OVERVIEW:
+
+00_setup.R              → Install packages (run once)
+01_data_prep.R          → Load & clean data
+02_exploratory_analysis.R → Visualizations
+03_depth_modeling.R     → Statistical models
+04_spatial_modeling.R   → Spatial predictions
+helper_functions.R      → Utility functions
+run_analysis.R          → Master script (runs all)
+
+═══════════════════════════════════════════════════════════════
+
+📊 MOCK DATA FILES:
+
+hr_cores.csv            → 10 high-res cores (500 samples)
+composite_cores.csv     → 20 composite cores (100 samples)
+
+These are realistic test datasets you can use immediately!
+
+═══════════════════════════════════════════════════════════════
+
+🎯 RECOMMENDED WORKFLOW:
+
+FIRST TIME:
+1. Read README.md (5 min)
+2. Run 00_setup.R (10 min)
+3. Run run_analysis.R with mock data (5-10 min)
+4. Explore outputs/ directory
+5. Review plots and tables
+
+WITH YOUR OWN DATA:
+1. Prepare your CSV files (see README.md for format)
+2. Replace hr_cores.csv and composite_cores.csv
+3. (Optional) Add covariate rasters to covariates/
+4. Run run_analysis.R
+5. Customize plots as needed
+
+═══════════════════════════════════════════════════════════════
+
+📁 FILE CHECKLIST:
+
+R Scripts (7):
+□ 00_setup.R
+□ 01_data_prep.R  
+□ 02_exploratory_analysis.R
+□ 03_depth_modeling.R
+□ 04_spatial_modeling.R
+□ helper_functions.R
+□ run_analysis.R
+
+Documentation (5):
+□ README.md
+□ COMPLETE_GUIDE.md
+□ QUICK_REFERENCE.md
+□ FILE_INDEX.md
+□ MOCK_DATA_README.md
+
+Data Files (2):
+□ hr_cores.csv
+□ composite_cores.csv
+
+═══════════════════════════════════════════════════════════════
+
+💡 TIPS:
+
+• Start with mock data to verify everything works
+• Read inline comments in R scripts for details  
+• Check QUICK_REFERENCE.md for common issues
+• All plots saved at 300 dpi (publication ready)
+• Analysis can run with OR without covariates
+
+═══════════════════════════════════════════════════════════════
+
+❓ NEED HELP?
+
+1. Check QUICK_REFERENCE.md for quick fixes
+2. Read COMPLETE_GUIDE.md for detailed help
+3. Look at inline comments in R scripts
+4. Verify data format matches examples
+
+═══════════════════════════════════════════════════════════════
+
+🎉 READY TO START?
+
+Open README.md and follow the Quick Start section!
+
+Good luck with your analysis! 🚀
+
+═══════════════════════════════════════════════════════════════
+
+Framework Version: 1.0
+Created: November 2025
+Total Package Size: ~145 KB
+
+═══════════════════════════════════════════════════════════════
